@@ -1,0 +1,74 @@
+# ---------------------------
+# Python
+# ---------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.DS_Store
+
+# Virtual environments
+env/
+venv/
+.venv/
+*.egg-info/
+.eggs/
+
+# ---------------------------
+# Environment & secrets
+# ---------------------------
+# DO NOT COMMIT these:
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Supabase
+supabase/.temp/
+supabase/config.toml
+supabase/functions/.env
+
+# OpenRouter / API keys (never commit)
+*.key
+*.secret
+
+# ---------------------------
+# Data & indexes
+# ---------------------------
+# Your FAISS indexes, repo-meta, uploaded zips, extracted source files
+data/
+!data/.gitkeep  # Keep empty folder if needed
+
+# If your project stores temp work in /tmp or local folders:
+tmp/
+temp/
+
+# ---------------------------
+# Uploaded or generated content
+# ---------------------------
+uploads/
+*.zip
+*.tar
+*.tar.gz
+
+# ---------------------------
+# Logs
+# ---------------------------
+*.log
+logs/
+nohup.out
+
+# ---------------------------
+# IDE / Editor
+# ---------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# ---------------------------
+# OS-specific files
+# ---------------------------
+Thumbs.db
+Icon?
