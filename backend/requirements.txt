@@ -1,4 +1,6 @@
 faiss-cpu
+torch==2.2.2
+sentence-transformers==2.2.2
 fastapi==0.100.0
 uvicorn[standard]==0.23.0
 python-dotenv==1.0.0
