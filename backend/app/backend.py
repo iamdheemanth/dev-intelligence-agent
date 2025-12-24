@@ -2,20 +2,13 @@
 """
 Project-scoped backend for Developer Intelligence Agent.
 
-All functionality operates on uploaded / cloned projects under data/projects/<project_id>.
-
-Endpoints (high level):
-- GET  /health
-- POST /projects             -> create (git clone) and index (background)
-- POST /projects/upload      -> upload zip and index (background)
-- GET  /projects             -> list projects & status
-- POST /projects/{id}/repo_search   -> search project index
-- POST /projects/{id}/summarize     -> summarize project topic (RAG + LLM)
-- POST /projects/{id}/recommend     -> recommend libraries (project-scoped)
-- POST /projects/{id}/triage        -> triage issue (project-scoped)
-- POST /projects/{id}/review        -> review code (by path or pasted)
-- POST /projects/{id}/docstrings    -> generate docstring (by path or pasted)
+This backend is intentionally thin: feature logic lives in feature modules:
+- app/triage/*         -> triage logic + LLM/heuristic fallbacks
+- app/recommender/*    -> code refactor recommender (diffs + fallbacks)
+- app/docsgen/*        -> summarizer wrapper (cleans results + LLM expansion)
+- app/review/*, app/docsgen/docstrings -> hidden endpoints (include_in_schema=False)
 """
+
 import logging
 import os
 import json
@@ -25,7 +18,10 @@ import zipfile
 import io
 import pathlib
 import datetime
-from typing import Optional
+import hashlib
+import tempfile
+import shutil
+from typing import Optional, Any
 
 from fastapi import FastAPI, Depends, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,15 +29,61 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
 
-# local imports (assumes same structure as your repo)
+# -------------------------------------------------------------------
+# Feature imports (delegated to feature modules)
+# -------------------------------------------------------------------
+# Auth dependency (keeps your existing auth)
 from app.auth import require_token
-from app.recommender.recommender import Recommender
-from app.triage.triage import classify_issue
-from app.review.review import review_code
-from app.docsgen.docstrings import docstring_for_func
-from app.docsgen.summarize import summarize_topic
-from app.repo_index.search import topk as repo_topk
-from app.repo_index.build_repo_index import build_index_for_root
+
+# recommender - precise diffs + high-level fallbacks in module
+try:
+    from app.recommender.code_recommender import suggest_refactors  # type: ignore
+except Exception:
+    suggest_refactors = None  # type: ignore
+
+# triage - classifier + suggestion helper
+try:
+    from app.triage.triage import classify_issue, suggest_actions_for_issue  # type: ignore
+except Exception:
+    # define minimal stubs so backend imports won't fail; feature module should replace these
+    def classify_issue(title: str, body: Optional[str] = ""):
+        return {"label": "needs-triage", "score": 0.0}
+
+    def suggest_actions_for_issue(title: str, body: str, classification: Optional[Any] = None):
+        return ["Reproduce and check logs."]
+
+# review / docstrings helpers (kept; hidden from Swagger)
+try:
+    from app.review.review import review_code  # type: ignore
+except Exception:
+    def review_code(code: str, use_llm: bool = True):
+        return {"review": "review module not installed"}
+
+try:
+    from app.docsgen.docstrings import docstring_for_func  # type: ignore
+except Exception:
+    def docstring_for_func(code: str):
+        return "docstring generator not installed"
+
+# summarize wrapper (cleans context and may call LLM)
+try:
+    from app.docsgen.summarize import summarize_topic  # type: ignore
+except Exception:
+    def summarize_topic(topic: str, index_dir: Optional[str] = None):
+        return {"summary": f"No summarizer installed; topic: {topic}"}
+
+# repo index search & build
+try:
+    from app.repo_index.search import topk as repo_topk  # type: ignore
+except Exception:
+    def repo_topk(q: str, k: int = 5, index_dir: Optional[str] = None):
+        return []
+
+try:
+    from app.repo_index.build_repo_index import build_index_for_root  # type: ignore
+except Exception:
+    def build_index_for_root(src_dir, out_dir):
+        return 0
 
 # -------------------------------------------------------------------
 # Load environment
@@ -69,8 +111,6 @@ app.add_middleware(
 # ---------- globals ----------
 PROJECTS_DIR = pathlib.Path("data/projects")
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-
-rec = Recommender()  # library recommender (keeps previous logic)
 
 # dependency for endpoints
 def auth_dep():
@@ -133,14 +173,8 @@ def read_project_file(project_id: str, rel_path: str) -> str:
 # -------------------------------------------------------------------
 # Optional Supabase integration (non-invasive)
 # -------------------------------------------------------------------
-# If SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are present, create client.
-# This is optional — code will continue to work locally if keys are not set.
 try:
     from supabase import create_client
-    import hashlib
-    import tempfile
-    import shutil
-
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "project-files")
@@ -155,9 +189,8 @@ try:
             logger.warning("Failed to initialize Supabase client: %s", e)
     else:
         supabase = None
-        logger.warning("Supabase env vars not set – DB/storage disabled")
+        logger.debug("Supabase env vars not set – DB/storage disabled")
 except Exception:
-    # supabase not installed or other import error — keep supabase = None
     supabase = None
     logger.debug("Supabase client library not available; continuing without DB/storage integration.")
 
@@ -189,7 +222,6 @@ class IssueRequest(BaseModel):
     body: Optional[str] = ""
 
 class ReviewRequest(BaseModel):
-    # either code (pasted) OR path to a file inside project (relative)
     code: Optional[str] = None
     path: Optional[str] = None
     use_llm: bool = True
@@ -197,6 +229,10 @@ class ReviewRequest(BaseModel):
 class DocstringRequestProject(BaseModel):
     code: Optional[str] = None
     path: Optional[str] = None
+
+class RefactorRequestProject(BaseModel):
+    scope: Optional[str] = None
+    limit_files: Optional[int] = 10
 
 # ---------- routes ----------
 @app.get("/health")
@@ -225,7 +261,6 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
                 url = git_url.replace("https://", f"https://{git_token}@")
             else:
                 url = git_url
-            # shallow clone
             subprocess.check_call(["git", "clone", "--depth", "1", url, str(src_root)])
             index_project_on_disk(src_root, project_id)
             (PROJECTS_DIR / project_id / "status.txt").write_text("ready")
@@ -235,7 +270,6 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
 
     background_tasks.add_task(_work)
 
-    # Non-invasive: ensure project row exists in Supabase (if available)
     if supabase:
         try:
             supabase.table("projects").upsert({
@@ -248,7 +282,6 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
         except Exception as e:
             logger.warning("Could not upsert project row into supabase: %s", e)
 
-    # After clone completes, archive & upload — do this in background to avoid blocking
     def _archive_and_upload():
         try:
             if src_root.exists():
@@ -263,8 +296,6 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
                         except Exception as e:
                             logger.warning("Supabase upload exception (archive): %s", e)
                             up = None
-
-                        # insert archive metadata (guarded)
                         try:
                             res = supabase.table("project_archives").insert({
                                 "project_id": project_id,
@@ -283,12 +314,8 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
 
     return {"project_id": project_id, "status": "indexing_started"}
 
-
 @app.post("/projects/upload", dependencies=[Depends(require_token)])
 def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """
-    Upload a zip file of a codebase. Returns project_id and indexes it in background.
-    """
     project_id = make_project_id()
     dest = PROJECTS_DIR / project_id
     src_root = project_src_dir(project_id)
@@ -297,7 +324,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
 
     zip_bytes = file.file.read()
 
-    # Ensure a project row exists in the DB so foreign key constraints succeed
     if supabase:
         try:
             supabase.table("projects").upsert({
@@ -322,7 +348,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
 
     background_tasks.add_task(_work)
 
-    # Non-invasive: upload archive to Supabase storage and insert archive metadata
     try:
         if supabase:
             try:
@@ -334,8 +359,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
                 except Exception as e:
                     logger.warning("Supabase upload exception for archive: %s", e)
                     up = None
-
-                # Try to insert metadata even if up is not a dict-like object.
                 try:
                     res = supabase.table("project_archives").insert({
                         "project_id": project_id,
@@ -350,7 +373,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
     except Exception:
         logger.debug("supabase not available for archive upload", exc_info=True)
 
-    # Also schedule per-file upload and metadata insertion after indexing finishes.
     def _upload_files_and_metadata():
         try:
             z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -369,7 +391,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
                         except Exception as e:
                             logger.warning("Failed to upload file %s: %s", info.filename, e)
                             continue
-                        # try to extract text content for search (naive)
                         text_content = None
                         try:
                             text_content = raw.decode("utf-8", errors="ignore")
@@ -396,7 +417,6 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
     background_tasks.add_task(_upload_files_and_metadata)
 
     return {"project_id": project_id, "status": "upload_received"}
-
 
 @app.get("/projects", dependencies=[Depends(require_token)])
 def list_projects():
@@ -431,27 +451,38 @@ def project_repo_search(project_id: str, req: ProjectSearchRequest):
 def project_summarize(project_id: str, req: ProjectSummarizeRequest):
     ensure_project_exists(project_id)
     ensure_index_ready(project_id)
-    return summarize_topic(req.topic, index_dir=str(project_index_dir(project_id)))
+    try:
+        # summarize_topic now returns cleaned summary and optional detailed_summary
+        resp = summarize_topic(req.topic, index_dir=str(project_index_dir(project_id)))
+        # If the summarizer returned a dict as top-level, ensure it includes project_id for clarity
+        if isinstance(resp, dict):
+            resp.setdefault("project_id", project_id)
+            return resp
+        return {"project_id": project_id, "summary": resp}
+    except Exception as e:
+        logger.exception("Error in project_summarize: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/projects/{project_id}/recommend", dependencies=[Depends(require_token)])
 def project_recommend(project_id: str, req: RecommendRequestProject):
-    """
-    Project-scoped recommend: for now we use the same recommender logic but expose it under the project route.
-    (You can later extend it to use repo-specific metadata.)
-    """
     ensure_project_exists(project_id)
-    # optionally you could use project files to augment the query/context
-    return {"query": req.query, "results": rec.recommend(req.query, req.top_k)}
+    return {"query": req.query, "results": rec.recommend(req.query, req.top_k)} if 'rec' in globals() else {"query": req.query, "results": []}
 
 @app.post("/projects/{project_id}/triage", dependencies=[Depends(require_token)])
 def project_triage(project_id: str, issue: IssueRequest):
     ensure_project_exists(project_id)
-    return classify_issue(issue.title, issue.body)
+    classification = classify_issue(issue.title, issue.body)
+    # delegate suggestion generation to triage module
+    try:
+        suggested_actions = suggest_actions_for_issue(issue.title, issue.body, classification)
+    except Exception:
+        logger.exception("Error generating triage suggestions")
+        suggested_actions = []
+    return {"classification": classification, "suggested_actions": suggested_actions}
 
-@app.post("/projects/{project_id}/review", dependencies=[Depends(require_token)])
+@app.post("/projects/{project_id}/review", dependencies=[Depends(require_token)], include_in_schema=False)
 def project_review(project_id: str, req: ReviewRequest):
     ensure_project_exists(project_id)
-    # if path provided, read file from project
     code = None
     if req.path:
         code = read_project_file(project_id, req.path)
@@ -459,10 +490,13 @@ def project_review(project_id: str, req: ReviewRequest):
         code = req.code
     else:
         raise HTTPException(status_code=400, detail="provide either 'code' or 'path'")
+    try:
+        return review_code(code, req.use_llm)
+    except Exception as e:
+        logger.exception("Error in project_review: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return review_code(code, req.use_llm)
-
-@app.post("/projects/{project_id}/docstrings", dependencies=[Depends(require_token)])
+@app.post("/projects/{project_id}/docstrings", dependencies=[Depends(require_token)], include_in_schema=False)
 def project_docstrings(project_id: str, req: DocstringRequestProject):
     ensure_project_exists(project_id)
     code = None
@@ -472,5 +506,24 @@ def project_docstrings(project_id: str, req: DocstringRequestProject):
         code = req.code
     else:
         raise HTTPException(status_code=400, detail="provide either 'code' or 'path'")
+    try:
+        return {"generated": docstring_for_func(code)}
+    except Exception as e:
+        logger.exception("Error in project_docstrings: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {"generated": docstring_for_func(code)}
+@app.post("/projects/{project_id}/refactor", dependencies=[Depends(require_token)])
+def project_refactor(project_id: str, req: RefactorRequestProject):
+    ensure_project_exists(project_id)
+    if suggest_refactors is None:
+        raise HTTPException(status_code=501, detail="Refactor recommender not installed. Add app.recommender.code_recommender to enable this feature.")
+    repo_root = str(project_src_dir(project_id))
+    scope_arg = req.scope if req.scope else None
+    limit_files = req.limit_files or 10
+    try:
+        # delegate to the recommender module (which should return precise diffs or high-level suggestions)
+        suggestions = suggest_refactors(scope=scope_arg, repo_root=repo_root, limit_files=limit_files) or []
+        return {"project_id": project_id, "suggestions": suggestions}
+    except Exception as e:
+        logger.exception("Error while running project-scoped refactor suggestions: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
