@@ -4,9 +4,9 @@ Project-scoped backend for Developer Intelligence Agent.
 
 This backend is intentionally thin: feature logic lives in feature modules:
 - app/triage/*         -> triage logic + LLM/heuristic fallbacks
-- app/recommender/*    -> code refactor recommender (diffs + fallbacks)
+- app/recommender/*    -> code refactor & library recommender
 - app/docsgen/*        -> summarizer wrapper (cleans results + LLM expansion)
-- app/review/*, app/docsgen/docstrings -> hidden endpoints (include_in_schema=False)
+- app/review/*, app.docsgen.docstrings -> hidden endpoints (include_in_schema=False)
 """
 
 import logging
@@ -35,11 +35,18 @@ from pathlib import Path
 # Auth dependency (keeps your existing auth)
 from app.auth import require_token
 
-# recommender - precise diffs + high-level fallbacks in module
+# recommender - code refactor recommender
 try:
     from app.recommender.code_recommender import suggest_refactors  # type: ignore
 except Exception:
     suggest_refactors = None  # type: ignore
+
+# library/tool recommender
+try:
+    from app.recommender.recommender import Recommender  # type: ignore
+    rec = Recommender()
+except Exception:
+    rec = None  # type: ignore
 
 # triage - classifier + suggestion helper
 try:
@@ -104,8 +111,10 @@ app = FastAPI(title="Developer Intelligence Agent (project-scoped)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------- globals ----------
@@ -150,7 +159,7 @@ def index_project_on_disk(src_dir: pathlib.Path, project_id: str) -> int:
     meta = {
         "project_id": project_id,
         "chunks_indexed": n,
-        "indexed_at": datetime.datetime.utcnow().isoformat()
+        "indexed_at": datetime.datetime.utcnow().isoformat(),
     }
     (PROJECTS_DIR / project_id / "meta.json").write_text(json.dumps(meta))
     return n
@@ -198,7 +207,7 @@ def zip_dir_bytes(src_dir: pathlib.Path) -> bytes:
     """Zip a directory into bytes (used for archive upload)."""
     with tempfile.TemporaryDirectory() as td:
         tmp_zip = pathlib.Path(td) / "archive.zip"
-        shutil.make_archive(str(tmp_zip.with_suffix("")), 'zip', root_dir=str(src_dir))
+        shutil.make_archive(str(tmp_zip.with_suffix("")), "zip", root_dir=str(src_dir))
         return tmp_zip.read_bytes()
 
 # ---------- request/response models ----------
@@ -272,12 +281,14 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
 
     if supabase:
         try:
-            supabase.table("projects").upsert({
-                "id": project_id,
-                "owner_id": None,
-                "name": git_url or project_id,
-                "description": None
-            }).execute()
+            supabase.table("projects").upsert(
+                {
+                    "id": project_id,
+                    "owner_id": None,
+                    "name": git_url or project_id,
+                    "description": None,
+                }
+            ).execute()
             logger.info("ensured projects row exists for %s", project_id)
         except Exception as e:
             logger.warning("Could not upsert project row into supabase: %s", e)
@@ -291,24 +302,39 @@ def create_project(payload: ProjectCreateRequest, background_tasks: BackgroundTa
                     archive_key = f"projects/{project_id}/archive_{sha}.zip"
                     if supabase:
                         try:
-                            up = supabase.storage.from_(SUPABASE_BUCKET).upload(archive_key, zip_bytes)
+                            up = supabase.storage.from_(SUPABASE_BUCKET).upload(
+                                archive_key, zip_bytes
+                            )
                             logger.info("supabase archive upload response: %r", up)
                         except Exception as e:
                             logger.warning("Supabase upload exception (archive): %s", e)
                             up = None
                         try:
-                            res = supabase.table("project_archives").insert({
-                                "project_id": project_id,
-                                "storage_key": archive_key,
-                                "size": len(zip_bytes)
-                            }).execute()
-                            logger.info("project_archives insert response: %s", res)
+                            res = supabase.table("project_archives").insert(
+                                {
+                                    "project_id": project_id,
+                                    "storage_key": archive_key,
+                                    "size": len(zip_bytes),
+                                }
+                            ).execute()
+                            logger.info(
+                                "project_archives insert response: %s", res
+                            )
                         except Exception as e:
-                            logger.warning("Could not insert project_archives row: %s", e)
+                            logger.warning(
+                                "Could not insert project_archives row: %s", e
+                            )
                 except Exception as e:
-                    logger.warning("Failed to create/upload archive for project %s: %s", project_id, e)
+                    logger.warning(
+                        "Failed to create/upload archive for project %s: %s",
+                        project_id,
+                        e,
+                    )
         except Exception:
-            logger.debug("archive/upload background task encountered an issue", exc_info=True)
+            logger.debug(
+                "archive/upload background task encountered an issue",
+                exc_info=True,
+            )
 
     background_tasks.add_task(_archive_and_upload)
 
@@ -326,12 +352,14 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
 
     if supabase:
         try:
-            supabase.table("projects").upsert({
-                "id": project_id,
-                "owner_id": None,
-                "name": project_id,
-                "description": None
-            }).execute()
+            supabase.table("projects").upsert(
+                {
+                    "id": project_id,
+                    "owner_id": None,
+                    "name": project_id,
+                    "description": None,
+                }
+            ).execute()
             logger.info("ensured projects row exists for %s", project_id)
         except Exception as e:
             logger.warning("Could not ensure projects row in supabase: %s", e)
@@ -354,24 +382,36 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
                 sha = hashlib.sha256(zip_bytes).hexdigest()
                 archive_key = f"projects/{project_id}/archive_{sha}.zip"
                 try:
-                    up = supabase.storage.from_(SUPABASE_BUCKET).upload(archive_key, zip_bytes)
+                    up = supabase.storage.from_(SUPABASE_BUCKET).upload(
+                        archive_key, zip_bytes
+                    )
                     logger.info("supabase archive upload response: %r", up)
                 except Exception as e:
-                    logger.warning("Supabase upload exception for archive: %s", e)
+                    logger.warning(
+                        "Supabase upload exception for archive: %s", e
+                    )
                     up = None
                 try:
-                    res = supabase.table("project_archives").insert({
-                        "project_id": project_id,
-                        "storage_key": archive_key,
-                        "size": len(zip_bytes)
-                    }).execute()
-                    logger.info("project_archives insert response: %s", res)
+                    res = supabase.table("project_archives").insert(
+                        {
+                            "project_id": project_id,
+                            "storage_key": archive_key,
+                            "size": len(zip_bytes),
+                        }
+                    ).execute()
+                    logger.info(
+                        "project_archives insert response: %s", res
+                    )
                 except Exception as e:
-                    logger.warning("Could not insert project_archives row: %s", e)
+                    logger.warning(
+                        "Could not insert project_archives row: %s", e
+                    )
             except Exception as e:
                 logger.warning("Supabase upload error for archive: %s", e)
     except Exception:
-        logger.debug("supabase not available for archive upload", exc_info=True)
+        logger.debug(
+            "supabase not available for archive upload", exc_info=True
+        )
 
     def _upload_files_and_metadata():
         try:
@@ -386,33 +426,57 @@ def upload_project(background_tasks: BackgroundTasks, file: UploadFile = File(..
                     file_key = f"projects/{project_id}/files/{file_sha}_{safe_path}"
                     if supabase:
                         try:
-                            upf = supabase.storage.from_(SUPABASE_BUCKET).upload(file_key, raw)
-                            logger.info("supabase file upload response for %s: %r", info.filename, upf)
+                            upf = supabase.storage.from_(SUPABASE_BUCKET).upload(
+                                file_key, raw
+                            )
+                            logger.info(
+                                "supabase file upload response for %s: %r",
+                                info.filename,
+                                upf,
+                            )
                         except Exception as e:
-                            logger.warning("Failed to upload file %s: %s", info.filename, e)
+                            logger.warning(
+                                "Failed to upload file %s: %s",
+                                info.filename,
+                                e,
+                            )
                             continue
                         text_content = None
                         try:
-                            text_content = raw.decode("utf-8", errors="ignore")
+                            text_content = raw.decode(
+                                "utf-8", errors="ignore"
+                            )
                         except Exception:
                             text_content = None
                         try:
-                            resf = supabase.table("project_files").insert({
-                                "project_id": project_id,
-                                "path": info.filename,
-                                "storage_key": file_key,
-                                "size": len(raw),
-                                "mime": "application/octet-stream",
-                                "sha256": file_sha,
-                                "content": text_content
-                            }).execute()
-                            logger.info("project_files insert response for %s: %s", info.filename, resf)
+                            resf = supabase.table("project_files").insert(
+                                {
+                                    "project_id": project_id,
+                                    "path": info.filename,
+                                    "storage_key": file_key,
+                                    "size": len(raw),
+                                    "mime": "application/octet-stream",
+                                    "sha256": file_sha,
+                                    "content": text_content,
+                                }
+                            ).execute()
+                            logger.info(
+                                "project_files insert response for %s: %s",
+                                info.filename,
+                                resf,
+                            )
                         except Exception as e:
-                            logger.warning("Could not insert project_files row for %s: %s", info.filename, e)
+                            logger.warning(
+                                "Could not insert project_files row for %s: %s",
+                                info.filename,
+                                e,
+                            )
                 except Exception as e:
                     logger.debug("skipping file in upload loop: %s", e)
         except Exception as e:
-            logger.debug("per-file upload background task failed: %s", e, exc_info=True)
+            logger.debug(
+                "per-file upload background task failed: %s", e, exc_info=True
+            )
 
     background_tasks.add_task(_upload_files_and_metadata)
 
@@ -444,7 +508,11 @@ def list_projects():
 def project_repo_search(project_id: str, req: ProjectSearchRequest):
     ensure_project_exists(project_id)
     ensure_index_ready(project_id)
-    results = repo_topk(req.query, k=req.top_k, index_dir=str(project_index_dir(project_id)))
+    results = repo_topk(
+        req.query,
+        k=req.top_k,
+        index_dir=str(project_index_dir(project_id)),
+    )
     return {"query": req.query, "results": results}
 
 @app.post("/projects/{project_id}/summarize", dependencies=[Depends(require_token)])
@@ -453,7 +521,9 @@ def project_summarize(project_id: str, req: ProjectSummarizeRequest):
     ensure_index_ready(project_id)
     try:
         # summarize_topic now returns cleaned summary and optional detailed_summary
-        resp = summarize_topic(req.topic, index_dir=str(project_index_dir(project_id)))
+        resp = summarize_topic(
+            req.topic, index_dir=str(project_index_dir(project_id))
+        )
         # If the summarizer returned a dict as top-level, ensure it includes project_id for clarity
         if isinstance(resp, dict):
             resp.setdefault("project_id", project_id)
@@ -466,7 +536,17 @@ def project_summarize(project_id: str, req: ProjectSummarizeRequest):
 @app.post("/projects/{project_id}/recommend", dependencies=[Depends(require_token)])
 def project_recommend(project_id: str, req: RecommendRequestProject):
     ensure_project_exists(project_id)
-    return {"query": req.query, "results": rec.recommend(req.query, req.top_k)} if 'rec' in globals() else {"query": req.query, "results": []}
+    if rec is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Recommender not installed or failed to import. Ensure app.recommender.recommender.Recommender is available.",
+        )
+    try:
+        results = rec.recommend(req.query, req.top_k)
+        return {"query": req.query, "results": results}
+    except Exception as e:
+        logger.exception("Error in project_recommend: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/projects/{project_id}/triage", dependencies=[Depends(require_token)])
 def project_triage(project_id: str, issue: IssueRequest):
@@ -474,13 +554,19 @@ def project_triage(project_id: str, issue: IssueRequest):
     classification = classify_issue(issue.title, issue.body)
     # delegate suggestion generation to triage module
     try:
-        suggested_actions = suggest_actions_for_issue(issue.title, issue.body, classification)
+        suggested_actions = suggest_actions_for_issue(
+            issue.title, issue.body, classification
+        )
     except Exception:
         logger.exception("Error generating triage suggestions")
         suggested_actions = []
     return {"classification": classification, "suggested_actions": suggested_actions}
 
-@app.post("/projects/{project_id}/review", dependencies=[Depends(require_token)], include_in_schema=False)
+@app.post(
+    "/projects/{project_id}/review",
+    dependencies=[Depends(require_token)],
+    include_in_schema=False,
+)
 def project_review(project_id: str, req: ReviewRequest):
     ensure_project_exists(project_id)
     code = None
@@ -489,14 +575,20 @@ def project_review(project_id: str, req: ReviewRequest):
     elif req.code:
         code = req.code
     else:
-        raise HTTPException(status_code=400, detail="provide either 'code' or 'path'")
+        raise HTTPException(
+            status_code=400, detail="provide either 'code' or 'path'"
+        )
     try:
         return review_code(code, req.use_llm)
     except Exception as e:
         logger.exception("Error in project_review: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/projects/{project_id}/docstrings", dependencies=[Depends(require_token)], include_in_schema=False)
+@app.post(
+    "/projects/{project_id}/docstrings",
+    dependencies=[Depends(require_token)],
+    include_in_schema=False,
+)
 def project_docstrings(project_id: str, req: DocstringRequestProject):
     ensure_project_exists(project_id)
     code = None
@@ -505,7 +597,9 @@ def project_docstrings(project_id: str, req: DocstringRequestProject):
     elif req.code:
         code = req.code
     else:
-        raise HTTPException(status_code=400, detail="provide either 'code' or 'path'")
+        raise HTTPException(
+            status_code=400, detail="provide either 'code' or 'path'"
+        )
     try:
         return {"generated": docstring_for_func(code)}
     except Exception as e:
@@ -516,14 +610,27 @@ def project_docstrings(project_id: str, req: DocstringRequestProject):
 def project_refactor(project_id: str, req: RefactorRequestProject):
     ensure_project_exists(project_id)
     if suggest_refactors is None:
-        raise HTTPException(status_code=501, detail="Refactor recommender not installed. Add app.recommender.code_recommender to enable this feature.")
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Refactor recommender not installed. "
+                "Add app.recommender.code_recommender.suggest_refactors to enable this feature."
+            ),
+        )
     repo_root = str(project_src_dir(project_id))
     scope_arg = req.scope if req.scope else None
     limit_files = req.limit_files or 10
     try:
         # delegate to the recommender module (which should return precise diffs or high-level suggestions)
-        suggestions = suggest_refactors(scope=scope_arg, repo_root=repo_root, limit_files=limit_files) or []
+        suggestions = (
+            suggest_refactors(
+                scope=scope_arg, repo_root=repo_root, limit_files=limit_files
+            )
+            or []
+        )
         return {"project_id": project_id, "suggestions": suggestions}
     except Exception as e:
-        logger.exception("Error while running project-scoped refactor suggestions: %s", e)
+        logger.exception(
+            "Error while running project-scoped refactor suggestions: %s", e
+        )
         raise HTTPException(status_code=500, detail=str(e))
